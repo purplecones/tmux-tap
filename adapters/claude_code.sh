@@ -8,6 +8,7 @@
 # This merges the required hooks into ~/.claude/settings.json.
 
 tap_push_capable_claude_code() { return 0; }
+tap_process_name_claude_code() { echo "claude"; }
 
 tap_install_claude_code() {
   local settings="${HOME}/.claude/settings.json"

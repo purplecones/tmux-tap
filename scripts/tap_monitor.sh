@@ -8,9 +8,10 @@ source "$PLUGIN_DIR/scripts/tap_core.sh"
 
 POLL_INTERVAL="${1:-2}"
 
-# Load adapters from config, skip push-capable ones
-_load_poll_adapters() {
+# Load adapters from config; collect poll adapters and known process names
+_load_adapters() {
   POLL_ADAPTERS=()
+  KNOWN_AGENT_CMDS=""
   local adapters
   adapters=$(get_tmux_option "@tap_adapters" "claude_code")
 
@@ -27,7 +28,15 @@ _load_poll_adapters() {
     if [[ -n "$file" ]]; then
       # shellcheck source=/dev/null
       source "$file"
-      # Skip if push-capable
+
+      # Collect process name for the stale-state reaper
+      if declare -f "tap_process_name_${adapter}" &>/dev/null; then
+        local pname
+        pname=$("tap_process_name_${adapter}")
+        KNOWN_AGENT_CMDS="${KNOWN_AGENT_CMDS:+$KNOWN_AGENT_CMDS|}${pname}"
+      fi
+
+      # Skip push-capable adapters from polling
       if declare -f "tap_push_capable_${adapter}" &>/dev/null; then
         tap_log "INFO" "monitor: skipping push-capable adapter '$adapter'"
         continue
@@ -60,20 +69,40 @@ _poll_once() {
   done < <(tmux list-panes -a -F $'#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_title}' 2>/dev/null)
 }
 
+# Reap stale state from panes where the agent process has exited.
+# Covers push adapters (which skip polling) and any other edge case
+# where the stop hook didn't fire (kill -9, OOM, crash).
+_reap_stale() {
+  [[ -z "$KNOWN_AGENT_CMDS" ]] && return 0
+
+  while IFS=$'\t' read -r pane_id pane_cmd tap_state; do
+    [[ -z "$pane_id" ]] && continue
+    [[ -z "$tap_state" || "$tap_state" == "inactive" ]] && continue
+
+    # Agent process still running — nothing to reap
+    if [[ "$pane_cmd" =~ ^($KNOWN_AGENT_CMDS)$ ]]; then
+      continue
+    fi
+
+    tap_log "INFO" "reaper: pane $pane_id state '$tap_state' but cmd='$pane_cmd' — resetting to inactive"
+    tap_emit "$pane_id" "inactive"
+  done < <(tmux list-panes -a -F $'#{pane_id}\t#{pane_current_command}\t#{@tap_state}' 2>/dev/null)
+}
+
 # Store PID for cleanup
 tmux setenv -g TAP_MONITOR_PID "$$" 2>/dev/null
 
 trap 'exit 0' TERM INT
 
 while true; do
-  _load_poll_adapters
+  _load_adapters
 
-  if [[ "${#POLL_ADAPTERS[@]}" -eq 0 ]]; then
-    # No poll adapters — sleep and check again (user may add one later)
-    sleep 10
-    continue
+  # Always reap stale state (covers push adapters and ungraceful exits)
+  _reap_stale
+
+  if [[ "${#POLL_ADAPTERS[@]}" -gt 0 ]]; then
+    _poll_once
   fi
 
-  _poll_once
   sleep "$POLL_INTERVAL"
 done

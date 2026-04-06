@@ -68,6 +68,14 @@ tap_uninstall_<name>() {
   echo "[TAP] <name>: nothing to uninstall"
 }
 
+# tap_process_name_<name>
+#
+# Echo the expected pane_current_command when this agent is running (e.g. "claude").
+# Used by the stale-state reaper to detect when an agent has exited without
+# firing its stop hook. Required for push adapters; optional for poll adapters.
+#
+# tap_process_name_<name>() { echo "<tool_binary>"; }
+
 # tap_push_capable_<name>  (makes this a push adapter)
 #
 # Define this (returning 0) to tell the monitor to skip polling this adapter.

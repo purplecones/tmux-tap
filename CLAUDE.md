@@ -38,7 +38,7 @@ State transitions are driven by `tap_emit <pane_id> <state>` in `tap_core.sh`. E
 
 ### Push vs. poll adapters
 
-- **Push adapters** define `tap_push_capable_<name>()` (returns 0) and call `tap_emit` directly from tool-native hooks. The monitor loop skips them entirely.
+- **Push adapters** define `tap_push_capable_<name>()` (returns 0) and call `tap_emit` directly from tool-native hooks. The monitor skips polling them but still runs the stale-state reaper.
 - **Poll adapters** implement `tap_detect_<name>` and `tap_state_<name>`; the monitor calls these on every interval.
 
 ### Adapter interface
@@ -46,6 +46,8 @@ State transitions are driven by `tap_emit <pane_id> <state>` in `tap_core.sh`. E
 **Poll adapters** — four functions: `tap_detect_<name>`, `tap_state_<name>`, `tap_install_<name>`, `tap_uninstall_<name>`
 
 **Push adapters** — define `tap_push_capable_<name>()` (returns 0) instead of detect/state, plus `tap_install_<name>` and `tap_uninstall_<name>`
+
+**All adapters** should define `tap_process_name_<name>()` returning the expected `pane_current_command` (e.g. `claude`). The monitor's stale-state reaper uses this to detect when an agent exits without firing its stop hook.
 
 Adapters load from (in priority order): absolute path, `~/.tmux-tap/adapters/<name>.sh`, `adapters/<name>.sh` in plugin dir.
 

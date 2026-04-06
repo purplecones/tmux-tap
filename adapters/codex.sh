@@ -8,6 +8,7 @@
 # This merges the required hooks into ~/.codex/hooks.json.
 
 tap_push_capable_codex() { return 0; }
+tap_process_name_codex() { echo "codex"; }
 
 tap_install_codex() {
   local hooks_file="${HOME}/.codex/hooks.json"

@@ -9,6 +9,7 @@
 # Requires: jq (for config merging)
 
 tap_push_capable_opencode() { return 0; }
+tap_process_name_opencode() { echo "opencode"; }
 
 tap_install_opencode() {
   local config_dir="${HOME}/.config/opencode"
