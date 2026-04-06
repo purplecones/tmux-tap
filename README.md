@@ -2,7 +2,7 @@
 
 **TAP — Tmux Agent Protocol**
 
-A tmux plugin that provides a standardized event system for agentic coding tools (Claude Code, Codex, Aider, etc.). TAP owns **state and events only** — it does not touch your status bar or pane borders. What you do with those events is entirely up to you.
+A tmux plugin that provides a standardized event system for agentic coding tools (Claude Code, Codex, OpenCode, etc.). TAP owns **state and events only** — it does not touch your status bar or pane borders. What you do with those events is entirely up to you.
 
 ## Why
 
@@ -10,7 +10,7 @@ Every agentic tool integrates with tmux differently. `tmux-tap` gives you one co
 
 ```tmux
 set -g @tap_on_plan_ready  "tmux select-pane -t '#{pane_id}'"
-set -g @tap_on_needs_input "tmux select-pane -t '#{pane_id}'"
+set -g @tap_on_asking      "tmux select-pane -t '#{pane_id}'"
 set -g @tap_on_agent_done  "afplay /System/Library/Sounds/Glass.aiff"
 ```
 
@@ -18,7 +18,7 @@ And a single pane option you can read anywhere:
 
 ```tmux
 # In pane-border-format, status-right, or any format string:
-#{@tap_state}   # → idle | running | thinking | plan_ready | needs_input | asking | done
+#{@tap_state}   # → inactive | running | thinking | plan_ready | asking | done
 ```
 
 ## Installation
@@ -65,7 +65,6 @@ Each event fires a shell command defined by a tmux option. The command is execut
 | `@tap_on_agent_start` | Agent becomes active in a pane |
 | `@tap_on_agent_thinking` | Agent is running or processing |
 | `@tap_on_plan_ready` | Agent finished planning, awaiting approval |
-| `@tap_on_needs_input` | Agent is blocked waiting for user input |
 | `@tap_on_asking` | Agent presented a question or choice |
 | `@tap_on_agent_done` | Agent completed its task |
 | `@tap_on_agent_stop` | Agent exits or pane closes |
@@ -75,14 +74,13 @@ Empty value = no-op.
 ## States
 
 ```
-idle ──[start]──► running ──► thinking
-                     │
-                     ├──► plan_ready   (awaiting plan approval)
-                     ├──► needs_input  (blocked, new prompt expected)
-                     ├──► asking       (agent asked a question)
-                     └──► done         (task complete)
+inactive ──[start]──► running ──► thinking
+                         │
+                         ├──► plan_ready   (awaiting plan approval)
+                         ├──► asking       (agent asked a question)
+                         └──► done         (task complete)
 
-Any state ──[stop/exit]──► idle
+Any state ──[stop/exit]──► inactive
 ```
 
 State is stored as a pane-scoped tmux option `@tap_state` — readable in any tmux format string at zero cost, or via `tmux show-options -pqv -t <pane_id> @tap_state` from any process.
@@ -99,13 +97,25 @@ Wires into Claude Code's `settings.json` hook system. No polling.
 
 This merges hooks into `~/.claude/settings.json` using `jq`.
 
-### Codex (poll-based by default)
+### Codex (push-based, ~0ms latency)
 
-Heuristic detection via process name and child processes. For near-realtime state, add to your shell rc:
+Wires into Codex's `hooks.json` hook system. No polling.
 
 ```sh
-source "${HOME}/.tmux/plugins/tmux-tap/install/codex_wrapper.sh"
+~/.tmux/plugins/tmux-tap/tap.tmux install codex
 ```
+
+This merges hooks into `~/.codex/hooks.json` using `jq` and enables `codex_hooks = true` in `~/.codex/config.toml`.
+
+### OpenCode (push-based, ~0ms latency)
+
+Installs a JavaScript plugin into OpenCode's config. No polling.
+
+```sh
+~/.tmux/plugins/tmux-tap/tap.tmux install opencode
+```
+
+This adds a plugin entry to `~/.config/opencode/opencode.json`.
 
 ## Writing your own adapter
 
@@ -123,8 +133,8 @@ Install to `~/.tmux-tap/adapters/my_tool.sh` and add `my_tool` to `@tap_adapters
 set -g pane-border-format \
   "#{?#{==:#{@tap_state},running},● ,\
 #{?#{==:#{@tap_state},plan_ready},📋 ,\
-#{?#{==:#{@tap_state},needs_input},⏳ ,\
 #{?#{==:#{@tap_state},asking},💬 ,\
+#{?#{==:#{@tap_state},done},✓ ,\
   }}}}#{pane_title}"
 ```
 
@@ -132,4 +142,4 @@ set -g pane-border-format \
 
 - tmux ≥ 3.0
 - bash ≥ 3.2
-- `jq` (optional, for Claude Code adapter)
+- `jq` (required for Claude Code, Codex, and OpenCode adapters)

@@ -18,6 +18,7 @@ This document is intended for LLMs and developers who need a complete, precise u
 10. [Bundled adapters](#10-bundled-adapters)
     - [Claude Code](#101-claude-code-adapter)
     - [Codex](#102-codex-adapter)
+    - [OpenCode](#103-opencode-adapter)
 11. [Configuration reference](#11-configuration-reference)
 12. [Integration cookbook](#12-integration-cookbook)
 13. [Debugging](#13-debugging)
@@ -61,10 +62,11 @@ tmux-tap/
 ├── adapters/
 │   ├── _template.sh          # Copy-paste boilerplate for new adapters
 │   ├── claude_code.sh        # Claude Code adapter (push-based via settings.json hooks)
-│   └── codex.sh              # Codex adapter (heuristic poll + optional push wrapper)
+│   ├── codex.sh              # Codex adapter (push-based via hooks.json hooks)
+│   └── opencode.sh           # OpenCode adapter (push-based via JS plugin)
 │
 └── install/
-    └── codex_wrapper.sh      # Source in shell rc to enable push mode for Codex
+    └── codex_wrapper.sh      # Legacy shell rc wrapper for Codex (superseded by push adapter)
 ```
 
 **Runtime paths (created at runtime, not in repo):**
@@ -72,7 +74,10 @@ tmux-tap/
 ```
 ~/.tmux-tap/
 └── hooks/
-    └── tap-stop.sh           # Written by tap_install_claude_code
+    ├── tap-stop.sh           # Written by tap_install_claude_code
+    ├── tap-run-codex.sh      # Written by tap_install_codex
+    ├── tap-stop-codex.sh     # Written by tap_install_codex
+    └── tap-opencode.js       # Written by tap_install_opencode
 
 ~/.claude/
 └── settings.json             # Claude Code config — TAP merges hooks here
@@ -86,31 +91,29 @@ Every tmux pane managed by TAP has exactly one of these states at any time:
 
 | State | Meaning | Typical trigger |
 |-------|---------|----------------|
-| `idle` | No agent active | Initial state; pane exit; `agent_stop` |
+| `inactive` | No agent active | Initial state; pane exit; `agent_stop` |
 | `running` | Agent executing or calling tools | `UserPromptSubmit`; tool use begins |
 | `thinking` | Agent processing (LLM inference, no tool calls) | Adapter-specific; not all adapters distinguish from `running` |
 | `plan_ready` | Agent finished planning, awaiting user approval | `ExitPlanMode` tool use in Claude Code |
-| `needs_input` | Agent blocked, expecting a new user prompt | `Stop` event after a response that doesn't end with a question |
 | `asking` | Agent presented a question or numbered choice | `AskUserQuestion` tool use; `Stop` after question-ending response |
-| `done` | Agent completed its task (transient) | Adapter-specific; quickly transitions to `needs_input` or `idle` |
+| `done` | Agent completed its task | `Stop` event after a response that doesn't end with a question |
 
 **State transitions and events fired:**
 
 ```
-idle ──[tap_emit running]──► running   → fires: agent_start, agent_thinking
-idle ──[tap_emit thinking]─► thinking  → fires: agent_start, agent_thinking
+inactive ──[tap_emit running]──► running   → fires: agent_start, agent_thinking
+inactive ──[tap_emit thinking]─► thinking  → fires: agent_start, agent_thinking
 
 running/thinking ──[tap_emit plan_ready]──► plan_ready  → fires: plan_ready
-running/thinking ──[tap_emit needs_input]─► needs_input → fires: needs_input
 running/thinking ──[tap_emit asking]──────► asking      → fires: asking
 running/thinking ──[tap_emit done]────────► done        → fires: agent_done
 
-any ──[tap_emit idle]──► idle  → fires: agent_stop (if previous state was not idle)
+any ──[tap_emit inactive]──► inactive  → fires: agent_stop (if previous state was not inactive)
 ```
 
-The `agent_start` event fires on the `idle → non-idle` transition, not on every `running` write. Similarly, `agent_stop` fires only on `non-idle → idle`. This prevents spurious events when a running agent transitions between `running` and `thinking`.
+The `agent_start` event fires on the `inactive → non-inactive` transition, not on every `running` write. Similarly, `agent_stop` fires only on `non-inactive → inactive`. This prevents spurious events when a running agent transitions between `running` and `thinking`.
 
-**Unhandled transitions:** `tap_emit` accepts any valid state from any current state. There is no strict enforcement of the diagram above — adapters may jump directly from `idle` to `plan_ready` if appropriate for their tool.
+**Unhandled transitions:** `tap_emit` accepts any valid state from any current state. There is no strict enforcement of the diagram above — adapters may jump directly from `inactive` to `plan_ready` if appropriate for their tool.
 
 ---
 
@@ -140,7 +143,7 @@ tmux list-panes -a -F "#{pane_id} #{pane_current_command} #{@tap_state}"
 
 Pane options are scoped per-pane — each pane has its own `@tap_state`, no cross-pane collision.
 
-**Lifetime:** Set on first `tap_emit`. Remains set until `tap_cleanup_pane` runs on pane exit (which transitions to `idle` and fires `agent_stop`).
+**Lifetime:** Set on first `tap_emit`. Remains set until `tap_cleanup_pane` runs on pane exit (which transitions to `inactive` and fires `agent_stop`).
 
 ---
 
@@ -152,13 +155,13 @@ The single entry point for all state changes. Defined in `scripts/tap_core.sh`.
 
 **Behavior:**
 1. Validates `new_state` against `TAP_VALID_STATES`
-2. Reads `old_state` from `@tap_state` (defaults to `idle` if unset)
+2. Reads `old_state` from `@tap_state` (defaults to `inactive` if unset)
 3. Returns immediately if `new_state == old_state` (idempotent)
 4. Writes `@tap_state` on the pane
 5. Calls `tmux refresh-client -S` (updates status bar without full redraw)
 6. Fires lifecycle events via `_tap_fire`:
-   - `agent_start` if `old_state == idle` and `new_state != idle`
-   - `agent_stop` if `new_state == idle` and `old_state != idle`
+   - `agent_start` if `old_state == inactive` and `new_state != inactive`
+   - `agent_stop` if `new_state == inactive` and `old_state != inactive`
    - State-specific event otherwise (see state→event mapping below)
 
 **State → event mapping:**
@@ -168,12 +171,11 @@ The single entry point for all state changes. Defined in `scripts/tap_core.sh`.
 | `running` | `agent_thinking` |
 | `thinking` | `agent_thinking` |
 | `plan_ready` | `plan_ready` |
-| `needs_input` | `needs_input` |
 | `asking` | `asking` |
 | `done` | `agent_done` |
-| `idle` | `agent_stop` (if transitioning from non-idle) |
+| `inactive` | `agent_stop` (if transitioning from non-inactive) |
 
-Note: `agent_start` is always paired with the state-specific event on the first transition. Both fire for `idle → running`: first `agent_start`, then `agent_thinking`.
+Note: `agent_start` is always paired with the state-specific event on the first transition. Both fire for `inactive → running`: first `agent_start`, then `agent_thinking`.
 
 ### `_tap_fire <pane_id> <event>`
 
@@ -182,7 +184,7 @@ Internal. Reads `@tap_on_<event>` from tmux global options and executes it via `
 **Handler value:** Any shell command string. Examples:
 
 ```tmux
-set -g @tap_on_needs_input "tmux select-pane -t '#{pane_id}'"
+set -g @tap_on_asking "tmux select-pane -t '#{pane_id}'"
 set -g @tap_on_agent_done  "~/.scripts/notify.sh '#{pane_title}' '#{session_name}'"
 set -g @tap_on_plan_ready  "osascript -e 'display notification \"Plan ready\" with title \"TAP\"'"
 ```
@@ -193,13 +195,12 @@ Empty string or unset = no-op. Errors in handler execution are silently ignored 
 
 | tmux option | Fires when |
 |-------------|-----------|
-| `@tap_on_agent_start` | Pane transitions from idle to any active state |
+| `@tap_on_agent_start` | Pane transitions from inactive to any active state |
 | `@tap_on_agent_thinking` | State becomes `running` or `thinking` |
 | `@tap_on_plan_ready` | State becomes `plan_ready` |
-| `@tap_on_needs_input` | State becomes `needs_input` |
 | `@tap_on_asking` | State becomes `asking` |
 | `@tap_on_agent_done` | State becomes `done` |
-| `@tap_on_agent_stop` | State becomes `idle` from any non-idle state |
+| `@tap_on_agent_stop` | State becomes `inactive` from any non-inactive state |
 
 ---
 
@@ -364,7 +365,7 @@ The `Stop` event fires when Claude finishes generating a response. The script re
 
 - If the message ends with `?` → state = `asking`
 - If the message contains a numbered list (lines starting with `1.`, `2.`, etc.) → state = `asking`
-- Otherwise → state = `needs_input`
+- Otherwise → state = `done`
 
 Then calls `tap_emit "$TMUX_PANE" "$state"`.
 
@@ -376,26 +377,57 @@ Then calls `tap_emit "$TMUX_PANE" "$state"`.
 
 **File:** `adapters/codex.sh`
 
-**Mode:** Poll-based by default. Push-capable if `install/codex_wrapper.sh` is sourced in shell rc.
+**Mode:** Push-based. Defines `tap_push_capable_codex`.
 
-**Detection (in order):**
-1. State file `~/.tmux-tap/codex/pane-states/<pane_id>` exists (written by wrapper)
-2. `pane_current_command == "node"` AND Codex found in process tree via `pgrep -P` or `ps`
+**State source:** `@tap_state` pane option, written directly by Codex hooks via hook scripts.
 
-**State source (in order):**
-1. State file if it exists
-2. Heuristic: terminal title starts with a braille spinner char → `running`
-3. Heuristic: Codex process has a tool child process (bash, git, npm, etc.) → `running`
-4. Default: `needs_input`
+**Installation (`tap_install_codex`):**
 
-**`install/codex_wrapper.sh`:**
+1. Enables `codex_hooks = true` in `~/.codex/config.toml`
+2. Creates `~/.tmux-tap/hooks/`
+3. Writes `tap-run-codex.sh` (UserPromptSubmit/PreToolUse handler — sets `running`)
+4. Writes `tap-stop-codex.sh` (Stop handler — heuristic same as Claude Code)
+5. If `~/.codex/hooks.json` already contains `tap_owned` entries, skips
+6. Uses `jq` to merge hooks into `hooks.json`:
 
-Sources into the user's shell rc. Wraps the `codex` command: writes `running` before execution, `needs_input` after. Also defines `tap_push_capable_codex` in the shell environment, which the monitor reads via `declare -f`.
+| Hook | Matcher | Action |
+|------|---------|--------|
+| `UserPromptSubmit` | — | Execute `tap-run-codex.sh` (sets `running`) |
+| `PreToolUse` | `Bash` | Execute `tap-run-codex.sh` (sets `running`) |
+| `Stop` | — | Execute `tap-stop-codex.sh` (emits `done` or `asking`) |
 
-```sh
-# In ~/.zshrc or ~/.bashrc:
-source "${HOME}/.tmux/plugins/tmux-tap/install/codex_wrapper.sh"
-```
+**`tap-stop-codex.sh` logic:** Same heuristic as Claude Code — reads `last_assistant_message`, emits `asking` if it ends with `?` or a numbered list, otherwise `done`.
+
+**Legacy wrapper:** `install/codex_wrapper.sh` is a shell rc wrapper from an earlier poll-based design. It still works but is superseded by the push adapter.
+
+### 10.3 OpenCode adapter
+
+**File:** `adapters/opencode.sh`
+
+**Mode:** Push-based. Defines `tap_push_capable_opencode`.
+
+**State source:** `@tap_state` pane option, written directly by a JavaScript plugin running inside OpenCode.
+
+**Installation (`tap_install_opencode`):**
+
+1. Creates `~/.tmux-tap/hooks/`
+2. Writes `tap-opencode.js` (JavaScript plugin executed by OpenCode's Bun runtime)
+3. Seeds initial `done` state for any already-running OpenCode panes
+4. If `~/.config/opencode/opencode.json` already contains a `tmux-tap` plugin entry, skips
+5. Uses `jq` to add the plugin path to the `plugin` array in `opencode.json`
+
+**JavaScript plugin events:**
+
+| Event | Action |
+|-------|--------|
+| `chat.message` | Emit `running` (user submitted prompt) |
+| `tool.execute.before` | Emit `running` (tool call starting) |
+| `question.asked` | Emit `asking` (native question tool) |
+| `question.replied` | Emit `running` (user answered) |
+| `message.part.delta` | Accumulate text for heuristic |
+| `server.instance.disposed` | Emit `done` or `asking` based on heuristic |
+
+**Heuristic:** Same pattern as Claude Code and Codex — if accumulated text ends with `?` or a numbered list, emit `asking`; otherwise `done`.
 
 ---
 
@@ -411,10 +443,9 @@ All options set via `set -g @option_name "value"` in `.tmux.conf`.
 | `@tap_on_agent_start` | `` | Command to run when agent becomes active |
 | `@tap_on_agent_thinking` | `` | Command to run when state is `running` or `thinking` |
 | `@tap_on_plan_ready` | `` | Command to run when state is `plan_ready` |
-| `@tap_on_needs_input` | `` | Command to run when state is `needs_input` |
 | `@tap_on_asking` | `` | Command to run when state is `asking` |
 | `@tap_on_agent_done` | `` | Command to run when state is `done` |
-| `@tap_on_agent_stop` | `` | Command to run when agent exits or state returns to idle |
+| `@tap_on_agent_stop` | `` | Command to run when agent exits or state returns to inactive |
 
 **Handler format strings:** All `@tap_on_*` values are passed to `tmux run-shell -t <pane_id>`, so tmux format strings are expanded relative to the target pane:
 
@@ -450,17 +481,17 @@ set -g status-right "#{@tap_state}"
 set -g pane-border-format \
   "#{?#{==:#{@tap_state},running},#[fg=colour208]● running  ,\
 #{?#{==:#{@tap_state},plan_ready},#[fg=colour135]📋 plan ready,\
-#{?#{==:#{@tap_state},needs_input},#[fg=colour226]⏳ needs input,\
 #{?#{==:#{@tap_state},asking},#[fg=colour81]💬 asking     ,\
+#{?#{==:#{@tap_state},done},#[fg=colour82]✓ done       ,\
   }}}}#[default] #{pane_title}"
 
 set -g pane-border-status top
 ```
 
-### Auto-focus pane when agent needs input
+### Auto-focus pane when agent needs attention
 
 ```tmux
-set -g @tap_on_needs_input "tmux select-pane -t '#{pane_id}'"
+set -g @tap_on_asking "tmux select-pane -t '#{pane_id}'"
 set -g @tap_on_plan_ready  "tmux select-pane -t '#{pane_id}'"
 ```
 
@@ -504,7 +535,7 @@ import (
 func getPaneState(paneID string) string {
     out, err := exec.Command("tmux", "show-options", "-pqv", "-t", paneID, "@tap_state").Output()
     if err != nil || len(out) == 0 {
-        return "idle"
+        return "inactive"
     }
     return strings.TrimSpace(string(out))
 }
@@ -592,16 +623,16 @@ kill -0 $(tmux showenv -g TAP_MONITOR_PID | cut -d= -f2) && echo running
 ```sh
 source ~/.tmux/plugins/tmux-tap/scripts/tap_helpers.sh
 source ~/.tmux/plugins/tmux-tap/scripts/tap_core.sh
-tap_emit "$TMUX_PANE" "needs_input"
+tap_emit "$TMUX_PANE" "done"
 ```
 
 ### Test event handler
 
 ```tmux
-set -g @tap_on_needs_input "printf '[TAP] needs_input fired for #{pane_id}\n' >> /tmp/tap-events.log"
+set -g @tap_on_agent_done "printf '[TAP] agent_done fired for #{pane_id}\n' >> /tmp/tap-events.log"
 ```
 
-Then trigger: `tap_emit "$TMUX_PANE" "needs_input"` and check `/tmp/tap-events.log`.
+Then trigger: `tap_emit "$TMUX_PANE" "done"` and check `/tmp/tap-events.log`.
 
 ### Verify Claude Code hooks are installed
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TAP (Tmux Agent Protocol) is a tmux plugin that provides a standardized state/event system for agentic coding tools (Claude Code, Codex, etc.). It owns **state and events only** — no status bar modifications, no pane borders.
+TAP (Tmux Agent Protocol) is a tmux plugin that provides a standardized state/event system for agentic coding tools (Claude Code, Codex, OpenCode, etc.). It owns **state and events only** — no status bar modifications, no pane borders.
 
 ## No build system
 
@@ -22,9 +22,10 @@ scripts/tap_core.sh        ← State machine: tap_emit, tap_get_state, tap_clean
 scripts/tap_monitor.sh     ← Background polling loop for non-push adapters
 scripts/pane-exit.sh       ← Cleans up state when a pane exits
 adapters/claude_code.sh    ← Push-based adapter (0ms latency via settings.json hooks)
-adapters/codex.sh          ← Poll-based adapter
+adapters/codex.sh          ← Push-based adapter (0ms latency via hooks.json hooks)
+adapters/opencode.sh       ← Push-based adapter (0ms latency via JS plugin)
 adapters/_template.sh      ← Canonical template for new adapters
-install/codex_wrapper.sh   ← Shell rc snippet for near-realtime Codex state
+install/codex_wrapper.sh   ← Legacy shell rc wrapper for Codex (superseded by push adapter)
 ```
 
 ### State flow
@@ -68,7 +69,7 @@ Commands run via `tmux run-shell`, so tmux format strings (`#{pane_id}`) are exp
 ## Key constraints
 
 - Bash ≥ 3.2 compatible (no associative arrays with `-A`, no `bash 4+` features)
-- `jq` required only for Claude Code adapter (install/uninstall and Stop hook state inference)
+- `jq` required for Claude Code, Codex, and OpenCode adapters (install/uninstall and Stop hook state inference)
 - All scripts must be sourced-safe (no side effects at source time except function definitions and variable assignments)
 - `tap_emit` is idempotent — same-state transitions are no-ops
 - The monitor loop re-reads `@tap_adapters` on every tick (users can add adapters without restarting)

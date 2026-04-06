@@ -27,13 +27,12 @@ Echoes the current state of the agent in this pane. Must be one of:
 
 | State | Meaning |
 |-------|---------|
-| `idle` | No agent active |
+| `inactive` | No agent active |
 | `running` | Agent is executing / calling tools |
 | `thinking` | Agent is processing (LLM inference, no tool calls) |
 | `plan_ready` | Agent finished planning, awaiting user approval |
-| `needs_input` | Agent blocked, waiting for user input |
 | `asking` | Agent presented a question or choice |
-| `done` | Agent completed task (transient, quickly becomes `idle` or `needs_input`) |
+| `done` | Agent completed task |
 
 #### `tap_install_<name>`
 
@@ -118,7 +117,7 @@ tap_detect_my_tool() {
 
 tap_state_my_tool() {
   # Inspect process, title, or output to determine state
-  echo "needs_input"
+  echo "done"
 }
 
 tap_install_my_tool() {

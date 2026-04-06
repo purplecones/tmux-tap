@@ -1,6 +1,6 @@
 # tmux-tap
 
-> TAP (Tmux Agent Protocol) — a tmux plugin that provides a standardized state machine and event system for agentic coding tools (Claude Code, Codex, Aider, etc.). TAP owns state and events only; it does not render anything. Other plugins and scripts consume TAP events to build their own UI or automation.
+> TAP (Tmux Agent Protocol) — a tmux plugin that provides a standardized state machine and event system for agentic coding tools (Claude Code, Codex, OpenCode, etc.). TAP owns state and events only; it does not render anything. Other plugins and scripts consume TAP events to build their own UI or automation.
 
 ## Docs
 
