@@ -1,0 +1,657 @@
+# TAP — Tmux Agent Protocol: Full Reference
+
+This document is intended for LLMs and developers who need a complete, precise understanding of TAP internals in order to extend, integrate with, or debug the system.
+
+---
+
+## Table of Contents
+
+1. [What TAP is and is not](#1-what-tap-is-and-is-not)
+2. [Repository layout](#2-repository-layout)
+3. [State machine](#3-state-machine)
+4. [State storage](#4-state-storage)
+5. [Event system](#5-event-system)
+6. [Adapter interface](#6-adapter-interface)
+7. [Push vs poll adapters](#7-push-vs-poll-adapters)
+8. [Monitor loop](#8-monitor-loop)
+9. [TPM entry point and lifecycle](#9-tpm-entry-point-and-lifecycle)
+10. [Bundled adapters](#10-bundled-adapters)
+    - [Claude Code](#101-claude-code-adapter)
+    - [Codex](#102-codex-adapter)
+11. [Configuration reference](#11-configuration-reference)
+12. [Integration cookbook](#12-integration-cookbook)
+13. [Debugging](#13-debugging)
+14. [Design decisions and trade-offs](#14-design-decisions-and-trade-offs)
+
+---
+
+## 1. What TAP is and is not
+
+**TAP is:**
+- A state machine per tmux pane that tracks which agentic coding tool is active and what lifecycle state it is in
+- An event dispatcher that fires user-defined shell commands on state transitions
+- An adapter system that lets any developer wire up a new tool in one shell file
+- A data source: `#{@tap_state}` is a tmux pane option readable in any format string at zero cost
+
+**TAP is not:**
+- A presentation layer — it does not modify pane borders, window titles, status bar icons, or colors
+- A process manager — it does not start, stop, or control agents
+- A communication bus between agents — it tracks state, it does not coordinate work
+
+**Separation of concerns:** TAP provides the "what state is the agent in?" answer. A separate plugin (or your own `.tmux.conf` hooks) decides what to do with that information visually or behaviorally.
+
+---
+
+## 2. Repository layout
+
+```
+tmux-tap/
+├── tap.tmux                  # TPM entry point — sourced by tmux at startup
+├── llms.txt                  # LLM index (brief)
+├── llms-full.md              # This file
+├── README.md                 # User-facing docs
+├── ADAPTER_SPEC.md           # Adapter contract reference
+│
+├── scripts/
+│   ├── tap_core.sh           # Core functions: tap_emit, tap_get_state, tap_cleanup_pane
+│   ├── tap_monitor.sh        # Background polling process for non-push adapters
+│   ├── tap_helpers.sh        # Utilities: get_tmux_option, tap_log, tap_refresh
+│   └── pane-exit.sh          # Called by pane-exited hook; delegates to tap_cleanup_pane
+│
+├── adapters/
+│   ├── _template.sh          # Copy-paste boilerplate for new adapters
+│   ├── claude_code.sh        # Claude Code adapter (push-based via settings.json hooks)
+│   └── codex.sh              # Codex adapter (heuristic poll + optional push wrapper)
+│
+└── install/
+    └── codex_wrapper.sh      # Source in shell rc to enable push mode for Codex
+```
+
+**Runtime paths (created at runtime, not in repo):**
+
+```
+~/.tmux-tap/
+└── hooks/
+    └── tap-stop.sh           # Written by tap_install_claude_code
+
+~/.claude/
+└── settings.json             # Claude Code config — TAP merges hooks here
+```
+
+---
+
+## 3. State machine
+
+Every tmux pane managed by TAP has exactly one of these states at any time:
+
+| State | Meaning | Typical trigger |
+|-------|---------|----------------|
+| `idle` | No agent active | Initial state; pane exit; `agent_stop` |
+| `running` | Agent executing or calling tools | `UserPromptSubmit`; tool use begins |
+| `thinking` | Agent processing (LLM inference, no tool calls) | Adapter-specific; not all adapters distinguish from `running` |
+| `plan_ready` | Agent finished planning, awaiting user approval | `ExitPlanMode` tool use in Claude Code |
+| `needs_input` | Agent blocked, expecting a new user prompt | `Stop` event after a response that doesn't end with a question |
+| `asking` | Agent presented a question or numbered choice | `AskUserQuestion` tool use; `Stop` after question-ending response |
+| `done` | Agent completed its task (transient) | Adapter-specific; quickly transitions to `needs_input` or `idle` |
+
+**State transitions and events fired:**
+
+```
+idle ──[tap_emit running]──► running   → fires: agent_start, agent_thinking
+idle ──[tap_emit thinking]─► thinking  → fires: agent_start, agent_thinking
+
+running/thinking ──[tap_emit plan_ready]──► plan_ready  → fires: plan_ready
+running/thinking ──[tap_emit needs_input]─► needs_input → fires: needs_input
+running/thinking ──[tap_emit asking]──────► asking      → fires: asking
+running/thinking ──[tap_emit done]────────► done        → fires: agent_done
+
+any ──[tap_emit idle]──► idle  → fires: agent_stop (if previous state was not idle)
+```
+
+The `agent_start` event fires on the `idle → non-idle` transition, not on every `running` write. Similarly, `agent_stop` fires only on `non-idle → idle`. This prevents spurious events when a running agent transitions between `running` and `thinking`.
+
+**Unhandled transitions:** `tap_emit` accepts any valid state from any current state. There is no strict enforcement of the diagram above — adapters may jump directly from `idle` to `plan_ready` if appropriate for their tool.
+
+---
+
+## 4. State storage
+
+Every call to `tap_emit` writes to exactly one place: the pane-scoped tmux option `@tap_state`.
+
+```sh
+tmux set-option -p -t "$pane_id" @tap_state "$new_state"
+```
+
+**Reading it:**
+
+```tmux
+# In any tmux format string (zero subprocess cost):
+pane-border-format "#{@tap_state}"
+status-right "#{P:#{@tap_state} }"       # iterate all panes (tmux ≥ 3.2)
+```
+
+```sh
+# From any shell or external process:
+tmux show-options -pqv -t "%7" @tap_state
+
+# List all panes and their states:
+tmux list-panes -a -F "#{pane_id} #{pane_current_command} #{@tap_state}"
+```
+
+Pane options are scoped per-pane — each pane has its own `@tap_state`, no cross-pane collision.
+
+**Lifetime:** Set on first `tap_emit`. Remains set until `tap_cleanup_pane` runs on pane exit (which transitions to `idle` and fires `agent_stop`).
+
+---
+
+## 5. Event system
+
+### `tap_emit <pane_id> <new_state>`
+
+The single entry point for all state changes. Defined in `scripts/tap_core.sh`.
+
+**Behavior:**
+1. Validates `new_state` against `TAP_VALID_STATES`
+2. Reads `old_state` from `@tap_state` (defaults to `idle` if unset)
+3. Returns immediately if `new_state == old_state` (idempotent)
+4. Writes `@tap_state` on the pane
+5. Calls `tmux refresh-client -S` (updates status bar without full redraw)
+6. Fires lifecycle events via `_tap_fire`:
+   - `agent_start` if `old_state == idle` and `new_state != idle`
+   - `agent_stop` if `new_state == idle` and `old_state != idle`
+   - State-specific event otherwise (see state→event mapping below)
+
+**State → event mapping:**
+
+| State written | Event fired |
+|--------------|-------------|
+| `running` | `agent_thinking` |
+| `thinking` | `agent_thinking` |
+| `plan_ready` | `plan_ready` |
+| `needs_input` | `needs_input` |
+| `asking` | `asking` |
+| `done` | `agent_done` |
+| `idle` | `agent_stop` (if transitioning from non-idle) |
+
+Note: `agent_start` is always paired with the state-specific event on the first transition. Both fire for `idle → running`: first `agent_start`, then `agent_thinking`.
+
+### `_tap_fire <pane_id> <event>`
+
+Internal. Reads `@tap_on_<event>` from tmux global options and executes it via `tmux run-shell -t <pane_id>`. The `-t` target causes tmux to expand format strings like `#{pane_id}`, `#{window_index}`, etc. relative to that pane.
+
+**Handler value:** Any shell command string. Examples:
+
+```tmux
+set -g @tap_on_needs_input "tmux select-pane -t '#{pane_id}'"
+set -g @tap_on_agent_done  "~/.scripts/notify.sh '#{pane_title}' '#{session_name}'"
+set -g @tap_on_plan_ready  "osascript -e 'display notification \"Plan ready\" with title \"TAP\"'"
+```
+
+Empty string or unset = no-op. Errors in handler execution are silently ignored (the handler runs detached).
+
+### Available events
+
+| tmux option | Fires when |
+|-------------|-----------|
+| `@tap_on_agent_start` | Pane transitions from idle to any active state |
+| `@tap_on_agent_thinking` | State becomes `running` or `thinking` |
+| `@tap_on_plan_ready` | State becomes `plan_ready` |
+| `@tap_on_needs_input` | State becomes `needs_input` |
+| `@tap_on_asking` | State becomes `asking` |
+| `@tap_on_agent_done` | State becomes `done` |
+| `@tap_on_agent_stop` | State becomes `idle` from any non-idle state |
+
+---
+
+## 6. Adapter interface
+
+An adapter is a single `.sh` file sourced by `tap.tmux`. It defines shell functions following the naming convention `tap_<function>_<adapter_name>`.
+
+**Adapter name rules:** lowercase, underscores only (e.g. `my_tool`, `claude_code`).
+
+### Poll adapter functions (required unless push-capable)
+
+#### `tap_detect_<name> PANE_ID PANE_CMD PANE_PID PANE_TITLE`
+
+Arguments provided by the monitor loop (values come from `tmux list-panes -F`):
+- `PANE_ID` — tmux pane ID, e.g. `%7`
+- `PANE_CMD` — `#{pane_current_command}`, e.g. `claude`, `node`, `zsh`
+- `PANE_PID` — `#{pane_pid}`, the PID of the shell/process in the pane
+- `PANE_TITLE` — `#{pane_title}`, the terminal title (set by the process)
+
+Returns: `0` (adapter owns this pane) or `1` (does not own).
+
+The monitor calls adapters in the order listed in `@tap_adapters`. The first adapter returning `0` claims the pane; subsequent adapters are not called for that pane.
+
+**Detection cost hierarchy (use in this order):**
+
+1. `pane_current_command` comparison — O(1), no subprocess
+2. `pgrep -P PANE_PID` — one subprocess per pane
+3. `tmux capture-pane -p` + regex — tmux IPC + string match, expensive
+
+#### `tap_state_<name> PANE_ID PANE_PID PANE_TITLE`
+
+Called after `tap_detect_<name>` returns `0`. Must echo exactly one state string.
+
+#### `tap_install_<name>`
+
+Called once on plugin load. Should be idempotent — safe to call multiple times.
+
+#### `tap_uninstall_<name>`
+
+Reverses `tap_install_<name>`.
+
+### Push adapter function
+
+#### `tap_push_capable_<name>` (replaces detect + state)
+
+Define this (returning `0`) to tell `tap_monitor.sh` to skip polling this adapter entirely. Push adapters call `tap_emit` directly from tool-native hooks — `tap_detect_*` and `tap_state_*` are not needed and never called. Still requires `tap_install_*` and `tap_uninstall_*`.
+
+```sh
+tap_push_capable_my_tool() { return 0; }
+```
+
+The monitor checks for this function's existence with `declare -f "tap_push_capable_${adapter}"` on each cycle. Hot-reload is supported: define the function after the monitor starts (e.g. by sourcing a wrapper) and the monitor skips the adapter on the next cycle.
+
+---
+
+## 7. Push vs poll adapters
+
+### Poll mode (default)
+
+The monitor calls `tap_detect_*` and `tap_state_*` every `@tap_poll_interval` seconds. Latency = poll interval. Suitable for tools without a hook system.
+
+**Cost:** One `tmux list-panes -a` call per cycle, plus per-pane adapter detection. Keep `tap_detect_*` cheap (process name match) to keep total cost low.
+
+### Push mode
+
+The adapter defines `tap_push_capable_*` and calls `tap_emit` directly from a tool-native hook or shell wrapper. The monitor skips this adapter entirely. Latency ≈ 0ms.
+
+**How to call `tap_emit` from a hook script:**
+
+```sh
+#!/usr/bin/env bash
+PLUGIN_DIR="${TAP_PLUGIN_DIR:-${HOME}/.tmux/plugins/tmux-tap}"
+source "$PLUGIN_DIR/scripts/tap_helpers.sh"
+source "$PLUGIN_DIR/scripts/tap_core.sh"
+
+tap_emit "${TMUX_PANE}" "running"
+```
+
+`$TMUX_PANE` is set automatically by tmux in any process running inside a tmux pane.
+
+**Recommendation:** If a tool has a hook system (Claude Code `settings.json` hooks, shell `precmd`/`preexec` hooks, etc.), use push mode. The poll loop exists only as a fallback.
+
+---
+
+## 8. Monitor loop
+
+**File:** `scripts/tap_monitor.sh`
+
+**Invocation:** Launched as a background bash process by `tap.tmux`. PID stored in `TAP_MONITOR_PID` tmux env var.
+
+**Cycle:**
+1. Read `@tap_adapters` from tmux (re-reads every cycle, supports hot config reload)
+2. Source each adapter file
+3. Filter out push-capable adapters (those defining `tap_push_capable_*`)
+4. If no poll adapters remain, sleep 10s and repeat
+5. Otherwise: call `tmux list-panes -a -F "#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_title}"`
+6. For each pane: call `tap_detect_*` for each poll adapter in order; on match call `tap_state_*` then `tap_emit`
+7. Sleep `@tap_poll_interval` seconds
+
+**Restart on plugin reload:** `tap.tmux` kills the previous monitor (by reading `TAP_MONITOR_PID`) before starting a new one. This prevents monitor accumulation across `tmux source ~/.tmux.conf` calls.
+
+**Graceful shutdown:** Kill the process stored in `TAP_MONITOR_PID`:
+```sh
+kill "$(tmux showenv -g TAP_MONITOR_PID | cut -d= -f2)"
+```
+
+---
+
+## 9. TPM entry point and lifecycle
+
+**File:** `tap.tmux`
+
+Executed by TPM (or `run` directive in `.tmux.conf`) at tmux startup and on config reload.
+
+**Sequence:**
+1. Exports `TAP_PLUGIN_DIR` (absolute path to plugin directory)
+2. Sources `scripts/tap_helpers.sh` and `scripts/tap_core.sh`
+3. Registers `pane-exited` hook (with deduplication: unset then set)
+4. Reads `@tap_adapters`, sources each adapter file, calls `tap_install_*`
+5. Reads `@tap_poll_interval`; kills previous monitor; starts new one if interval > 0
+6. Handles subcommands: `tap.tmux install <name>` or `tap.tmux uninstall <name>`
+
+**Hook deduplication pattern (critical for reload correctness):**
+
+```sh
+tmux set-hook -ug pane-exited   # remove previous binding
+tmux set-hook -g  pane-exited "run-shell '...'"
+```
+
+Without the `-ug` (unset global) call, reloading `.tmux.conf` accumulates duplicate hook bindings that fire multiple times per event.
+
+---
+
+## 10. Bundled adapters
+
+### 10.1 Claude Code adapter
+
+**File:** `adapters/claude_code.sh`
+
+**Mode:** Push-based. Defines `tap_push_capable_claude_code`.
+
+**State source:** `@tap_state` pane option, written directly by Claude Code hooks via `tmux set-option -p`.
+
+**Installation (`tap_install_claude_code`):**
+
+1. Creates `~/.tmux-tap/hooks/`
+2. Writes `~/.tmux-tap/hooks/tap-stop.sh` (the Stop event handler)
+3. If `~/.claude/settings.json` already contains `tap_` entries, skips
+4. Uses `jq` to merge the following hooks into `settings.json`:
+
+| Hook | Matcher | Action |
+|------|---------|--------|
+| `UserPromptSubmit` | — | Set `@tap_state running` on pane |
+| `PreToolUse` | `AskUserQuestion` | Set `@tap_state asking` |
+| `PreToolUse` | `ExitPlanMode` | Set `@tap_state plan_ready` |
+| `PreToolUse` | `` (generic, catches all others) | Set `@tap_state running` |
+| `Stop` | — | Execute `~/.tmux-tap/hooks/tap-stop.sh` |
+
+**`tap-stop.sh` logic:**
+
+The `Stop` event fires when Claude finishes generating a response. The script reads the full event JSON from stdin, extracts `last_assistant_message`, then applies heuristics:
+
+- If the message ends with `?` → state = `asking`
+- If the message contains a numbered list (lines starting with `1.`, `2.`, etc.) → state = `asking`
+- Otherwise → state = `needs_input`
+
+Then calls `tap_emit "$TMUX_PANE" "$state"`.
+
+**Why this heuristic:** Claude Code's `Stop` hook does not expose a semantic "is this a question?" flag. The message text is the only signal available. This covers the common cases (`AskUserQuestion` already catches explicit questions; `Stop` catches implicit ones).
+
+**`jq` requirement:** If `jq` is not installed, `tap_install_claude_code` prints the JSON fragment and exits without modifying `settings.json`. The user must merge it manually.
+
+### 10.2 Codex adapter
+
+**File:** `adapters/codex.sh`
+
+**Mode:** Poll-based by default. Push-capable if `install/codex_wrapper.sh` is sourced in shell rc.
+
+**Detection (in order):**
+1. State file `~/.tmux-tap/codex/pane-states/<pane_id>` exists (written by wrapper)
+2. `pane_current_command == "node"` AND Codex found in process tree via `pgrep -P` or `ps`
+
+**State source (in order):**
+1. State file if it exists
+2. Heuristic: terminal title starts with a braille spinner char → `running`
+3. Heuristic: Codex process has a tool child process (bash, git, npm, etc.) → `running`
+4. Default: `needs_input`
+
+**`install/codex_wrapper.sh`:**
+
+Sources into the user's shell rc. Wraps the `codex` command: writes `running` before execution, `needs_input` after. Also defines `tap_push_capable_codex` in the shell environment, which the monitor reads via `declare -f`.
+
+```sh
+# In ~/.zshrc or ~/.bashrc:
+source "${HOME}/.tmux/plugins/tmux-tap/install/codex_wrapper.sh"
+```
+
+---
+
+## 11. Configuration reference
+
+All options set via `set -g @option_name "value"` in `.tmux.conf`.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `@tap_adapters` | `claude_code` | Space-separated list of adapter names to load, in priority order |
+| `@tap_poll_interval` | `2` | Seconds between monitor poll cycles. `0` disables polling entirely |
+| `@tap_log_file` | `` (empty) | If set, TAP writes debug logs to this file |
+| `@tap_on_agent_start` | `` | Command to run when agent becomes active |
+| `@tap_on_agent_thinking` | `` | Command to run when state is `running` or `thinking` |
+| `@tap_on_plan_ready` | `` | Command to run when state is `plan_ready` |
+| `@tap_on_needs_input` | `` | Command to run when state is `needs_input` |
+| `@tap_on_asking` | `` | Command to run when state is `asking` |
+| `@tap_on_agent_done` | `` | Command to run when state is `done` |
+| `@tap_on_agent_stop` | `` | Command to run when agent exits or state returns to idle |
+
+**Handler format strings:** All `@tap_on_*` values are passed to `tmux run-shell -t <pane_id>`, so tmux format strings are expanded relative to the target pane:
+
+```
+#{pane_id}         → %7
+#{pane_index}      → 0
+#{window_index}    → 2
+#{session_name}    → main
+#{pane_title}      → the terminal title
+#{pane_current_path} → /Users/me/project
+```
+
+**Environment variable read by adapters:**
+
+| Variable | Set by | Purpose |
+|----------|--------|---------|
+| `TAP_PLUGIN_DIR` | `tap.tmux` | Absolute path to plugin directory |
+| `TAP_MONITOR_PID` | `tap_monitor.sh` | PID of the background monitor process |
+
+---
+
+## 12. Integration cookbook
+
+### Status bar: show state for current pane
+
+```tmux
+set -g status-right "#{@tap_state}"
+```
+
+### Pane borders: color-coded by state
+
+```tmux
+set -g pane-border-format \
+  "#{?#{==:#{@tap_state},running},#[fg=colour208]● running  ,\
+#{?#{==:#{@tap_state},plan_ready},#[fg=colour135]📋 plan ready,\
+#{?#{==:#{@tap_state},needs_input},#[fg=colour226]⏳ needs input,\
+#{?#{==:#{@tap_state},asking},#[fg=colour81]💬 asking     ,\
+  }}}}#[default] #{pane_title}"
+
+set -g pane-border-status top
+```
+
+### Auto-focus pane when agent needs input
+
+```tmux
+set -g @tap_on_needs_input "tmux select-pane -t '#{pane_id}'"
+set -g @tap_on_plan_ready  "tmux select-pane -t '#{pane_id}'"
+```
+
+### macOS notification on plan ready
+
+```tmux
+set -g @tap_on_plan_ready \
+  "osascript -e 'display notification \"Plan ready for review\" with title \"TAP\" subtitle \"#{pane_title}\"'"
+```
+
+### macOS sound on task done
+
+```tmux
+set -g @tap_on_agent_done "afplay /System/Library/Sounds/Glass.aiff"
+```
+
+### Log all state transitions
+
+```tmux
+set -g @tap_log_file "/tmp/tap.log"
+```
+
+### Reading state from a shell script
+
+```sh
+# Get state for a specific pane
+state=$(tmux show-options -pqv -t "%7" @tap_state)
+
+# List all panes with their states
+tmux list-panes -a -F "#{pane_id} #{pane_current_command} #{@tap_state}"
+```
+
+### Reading state from a Go program
+
+```go
+import (
+    "os/exec"
+    "strings"
+)
+
+func getPaneState(paneID string) string {
+    out, err := exec.Command("tmux", "show-options", "-pqv", "-t", paneID, "@tap_state").Output()
+    if err != nil || len(out) == 0 {
+        return "idle"
+    }
+    return strings.TrimSpace(string(out))
+}
+```
+
+### Writing a minimal third-party adapter
+
+Create `~/.tmux-tap/adapters/my_tool.sh`:
+
+```sh
+#!/usr/bin/env bash
+# Push-based adapter — calls tap_emit directly, no polling needed
+
+tap_push_capable_my_tool() { return 0; }
+
+tap_install_my_tool() {
+  echo "[TAP] my_tool adapter ready."
+}
+
+tap_uninstall_my_tool() {
+  echo "[TAP] my_tool adapter removed."
+}
+```
+
+From your tool's hooks:
+
+```sh
+PLUGIN_DIR="${TAP_PLUGIN_DIR:-${HOME}/.tmux/plugins/tmux-tap}"
+source "$PLUGIN_DIR/scripts/tap_helpers.sh"
+source "$PLUGIN_DIR/scripts/tap_core.sh"
+tap_emit "$TMUX_PANE" "running"
+```
+
+Add to `.tmux.conf`:
+
+```tmux
+set -g @tap_adapters "claude_code my_tool"
+```
+
+From your tool's hooks, write state:
+
+```sh
+# Your tool fires this when it starts working
+PLUGIN_DIR="${TAP_PLUGIN_DIR:-${HOME}/.tmux/plugins/tmux-tap}"
+source "$PLUGIN_DIR/scripts/tap_helpers.sh"
+source "$PLUGIN_DIR/scripts/tap_core.sh"
+tap_emit "$TMUX_PANE" "running"
+```
+
+---
+
+## 13. Debugging
+
+### Enable logging
+
+```tmux
+set -g @tap_log_file "/tmp/tap.log"
+```
+
+Tail it: `tail -f /tmp/tap.log`
+
+### Inspect pane state
+
+```sh
+# Current pane
+tmux show-options -pqv @tap_state
+
+# Specific pane
+tmux show-options -pqv -t %7 @tap_state
+
+# All panes
+tmux list-panes -a -F "#{pane_id} #{pane_current_command} #{@tap_state}"
+```
+
+### Check monitor is running
+
+```sh
+tmux showenv -g TAP_MONITOR_PID
+# Then verify the process exists:
+kill -0 $(tmux showenv -g TAP_MONITOR_PID | cut -d= -f2) && echo running
+```
+
+### Manually fire a state transition
+
+```sh
+source ~/.tmux/plugins/tmux-tap/scripts/tap_helpers.sh
+source ~/.tmux/plugins/tmux-tap/scripts/tap_core.sh
+tap_emit "$TMUX_PANE" "needs_input"
+```
+
+### Test event handler
+
+```tmux
+set -g @tap_on_needs_input "printf '[TAP] needs_input fired for #{pane_id}\n' >> /tmp/tap-events.log"
+```
+
+Then trigger: `tap_emit "$TMUX_PANE" "needs_input"` and check `/tmp/tap-events.log`.
+
+### Verify Claude Code hooks are installed
+
+```sh
+cat ~/.claude/settings.json | jq '.hooks.Stop'
+```
+
+### Reload plugin without restarting tmux
+
+```sh
+tmux source ~/.tmux.conf
+# or directly:
+bash ~/.tmux/plugins/tmux-tap/tap.tmux
+```
+
+---
+
+## 14. Design decisions and trade-offs
+
+### Why pane options as the single state channel
+
+TAP uses pane-scoped options (`tmux set-option -p`) as the sole state store.
+
+**Reason:** Pane options are readable directly in format strings as `#{@tap_state}` with zero subprocesses and zero file I/O. They are also readable from any external process via `tmux show-options -pqv -t <pane_id> @tap_state`. A single channel means a single source of truth — no synchronization, no stale state.
+
+### Why not named pipes or Unix sockets for event dispatch
+
+An earlier design considered a named pipe per pane or a Unix socket for event delivery. Both were rejected:
+
+- Named pipes block `open()` until both ends are ready — brittle across sessions
+- A socket listener is another process to manage, adds latency for the common case
+- For human-facing UI, 2s polling latency for poll adapters and ~0ms for push adapters is already fast enough
+- Push adapters (Claude Code) bypass polling entirely, achieving the near-realtime case without IPC complexity
+
+### Why `tmux run-shell` for event handlers (not direct eval)
+
+Handler commands run via `tmux run-shell -t <pane_id>` rather than being eval'd in the current shell:
+
+1. tmux expands format strings like `#{pane_id}` at call time relative to the target pane
+2. Handlers run detached and do not block the state update path
+3. Errors in handlers do not affect TAP itself
+
+The trade-off: there is a small fork overhead per event. Acceptable given events fire at human-interaction frequency (not in tight loops).
+
+### Why hook deduplication matters
+
+tmux accumulates multiple `run-shell` entries for the same hook if you call `set-hook -g` multiple times with the same hook name without removing the previous binding first. On a busy machine where `.tmux.conf` is reloaded frequently, this causes the `pane-exited` cleanup to run 10+ times for each pane exit, emitting multiple `agent_stop` events.
+
+Solution: always `set-hook -ug <hook>` before `set-hook -g <hook>` in `tap.tmux`.
+
+### Why the monitor re-reads `@tap_adapters` every cycle
+
+Allows hot-reload: changing `@tap_adapters` in `.tmux.conf` and running `tmux source ~/.tmux.conf` takes effect on the next monitor cycle without restarting the monitor. The cost is one `tmux show-options` call per cycle — negligible.
