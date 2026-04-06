@@ -296,7 +296,7 @@ tap_emit "${TMUX_PANE}" "running"
 2. Source each adapter file
 3. Filter out push-capable adapters (those defining `tap_push_capable_*`)
 4. If no poll adapters remain, sleep 10s and repeat
-5. Otherwise: call `tmux list-panes -a -F "#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_title}"`
+5. Otherwise: call `tmux list-panes -a -F '#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_title}'`
 6. For each pane: call `tap_detect_*` for each poll adapter in order; on match call `tap_state_*` then `tap_emit`
 7. Sleep `@tap_poll_interval` seconds
 
@@ -573,16 +573,6 @@ Add to `.tmux.conf`:
 
 ```tmux
 set -g @tap_adapters "claude_code my_tool"
-```
-
-From your tool's hooks, write state:
-
-```sh
-# Your tool fires this when it starts working
-PLUGIN_DIR="${TAP_PLUGIN_DIR:-${HOME}/.tmux/plugins/tmux-tap}"
-source "$PLUGIN_DIR/scripts/tap_helpers.sh"
-source "$PLUGIN_DIR/scripts/tap_core.sh"
-tap_emit "$TMUX_PANE" "running"
 ```
 
 ---
