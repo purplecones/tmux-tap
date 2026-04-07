@@ -42,6 +42,18 @@ Called once on plugin load. Set up any tool-side plumbing: merge config files, r
 
 Reverses `tap_install_<name>`.
 
+### Common functions
+
+#### `tap_process_name_<name>`
+
+Echoes the expected `pane_current_command` for this agent (e.g. `claude`, `codex`). The monitor's stale-state reaper calls this to detect when an agent process exits without firing its stop hook — if the process name disappears from a pane that still has a non-`inactive` state, the reaper resets it.
+
+All adapters should define this. Push adapters especially need it because they have no poll cycle to notice a disappeared process.
+
+```sh
+tap_process_name_my_tool() { echo "my-tool"; }
+```
+
 ### Push adapter functions
 
 #### `tap_push_capable_<name>` (replaces detect + state)
@@ -84,6 +96,7 @@ Adapters in the bundled `adapters/` directory are found automatically by name. F
 # TAP Adapter: my_tool (push-based)
 
 tap_push_capable_my_tool() { return 0; }
+tap_process_name_my_tool() { echo "my-tool"; }
 
 tap_install_my_tool() {
   echo "[TAP] my_tool adapter ready. Wire your tool to call tap_emit directly."
@@ -119,6 +132,8 @@ tap_state_my_tool() {
   # Inspect process, title, or output to determine state
   echo "done"
 }
+
+tap_process_name_my_tool() { echo "my-tool"; }
 
 tap_install_my_tool() {
   echo "[TAP] my_tool adapter ready."
