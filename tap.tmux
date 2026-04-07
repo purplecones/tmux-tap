@@ -15,6 +15,20 @@ tmux set-hook -ug pane-exited 2>/dev/null
 tmux set-hook -g  pane-exited \
   "run-shell '${PLUGIN_DIR}/scripts/pane-exit.sh #{pane_id}'"
 
+# ── Write shared emit script used by push adapter hooks ──────────────────────
+
+mkdir -p "${HOME}/.tmux-tap/hooks"
+cat > "${HOME}/.tmux-tap/hooks/tap-emit.sh" << EMIT
+#!/usr/bin/env bash
+PLUGIN_DIR="\${TAP_PLUGIN_DIR:-${PLUGIN_DIR}}"
+source "\$PLUGIN_DIR/scripts/tap_helpers.sh" 2>/dev/null || exit 0
+source "\$PLUGIN_DIR/scripts/tap_core.sh"   2>/dev/null || exit 0
+pane_id="\${TMUX_PANE:-}"
+[[ -z "\$pane_id" ]] && exit 0
+tap_emit "\$pane_id" "\$1"
+EMIT
+chmod +x "${HOME}/.tmux-tap/hooks/tap-emit.sh"
+
 # ── Load adapters ─────────────────────────────────────────────────────────────
 
 TAP_ADAPTERS=$(get_tmux_option "@tap_adapters" "claude_code")

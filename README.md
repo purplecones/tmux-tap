@@ -52,6 +52,9 @@ set -g @tap_adapters "claude_code codex"
 # Poll interval for non-push adapters (seconds, 0 = disable polling)
 set -g @tap_poll_interval "2"
 
+# Idle timeout — fire @tap_on_agent_idle after N seconds in done/asking (0 = disabled)
+set -g @tap_idle_timeout "30"
+
 # Optional: log file for debugging
 set -g @tap_log_file "/tmp/tap.log"
 ```
@@ -68,6 +71,7 @@ Each event fires a shell command defined by a tmux option. The command is execut
 | `@tap_on_asking` | Agent presented a question or choice |
 | `@tap_on_agent_done` | Agent completed its task |
 | `@tap_on_agent_stop` | Agent exits or pane closes |
+| `@tap_on_agent_idle` | Agent in `done`/`asking` longer than `@tap_idle_timeout` seconds |
 
 Empty value = no-op.
 
@@ -84,6 +88,12 @@ Any state ──[stop/exit]──► inactive
 ```
 
 State is stored as a pane-scoped tmux option `@tap_state` — readable in any tmux format string at zero cost, or via `tmux show-options -pqv -t <pane_id> @tap_state` from any process.
+
+The timestamp of the last state change is stored in `@tap_state_since` (epoch seconds). A helper script is provided to format this as a human-readable duration:
+
+```sh
+scripts/tap-duration.sh <pane_id>   # → "3m12s", "45s", "1h5m"
+```
 
 ## Bundled adapters
 

@@ -40,8 +40,9 @@ export default function TapPlugin({ $ }) {
   const paneId = process.env.TMUX_PANE
   if (!paneId || !process.env.TMUX) return {}
 
+  const emitScript = `${process.env.HOME}/.tmux-tap/hooks/tap-emit.sh`
   const emit = (state) =>
-    $`tmux set-option -p -t ${paneId} @tap_state ${state}`.catch(() => {})
+    $`${emitScript} ${state}`.catch(() => {})
 
   // Accumulate streaming assistant text for the text-based asking heuristic.
   let lastText = ""
@@ -59,7 +60,7 @@ export default function TapPlugin({ $ }) {
     // Tool calls — still running.
     "tool.execute.before": () => emit("running"),
 
-    event: ({ event }) => {
+    event: async ({ event }) => {
       switch (event?.type) {
 
         // Native question tool — explicit asking signal, no heuristic needed.
@@ -82,14 +83,13 @@ export default function TapPlugin({ $ }) {
         }
 
         // Turn ended — emit done or asking based on heuristic (if no native question).
-        case "server.instance.disposed":
+        case "server.instance.disposed": {
           if (nativeAsking) break  // already in asking state
-          const trimmed = lastText.trimEnd()
-          const isAsking =
-            trimmed.endsWith("?") ||
-            /\n\s*\d+\.\s/.test(trimmed.split("\n").slice(-5).join("\n"))
-          emit(isAsking ? "asking" : "done")
+          const classifyScript = `${process.env.TAP_PLUGIN_DIR || `${process.env.HOME}/.tmux/plugins/tmux-tap`}/scripts/tap-classify.sh`
+          const result = await $`echo ${lastText} | ${classifyScript}`.text().catch(() => "done")
+          emit(result.trim() === "asking" ? "asking" : "done")
           break
+        }
       }
     },
   }

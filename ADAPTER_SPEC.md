@@ -68,7 +68,15 @@ Still requires `tap_install_<name>` and `tap_uninstall_<name>`.
 
 ## Calling `tap_emit`
 
-From a push-based hook or wrapper:
+The simplest approach is the shared emit wrapper (generated at plugin load):
+
+```sh
+~/.tmux-tap/hooks/tap-emit.sh running
+```
+
+This handles sourcing, reads `$TMUX_PANE` from the environment, and calls `tap_emit`. All bundled push adapters use this.
+
+For more control, source the scripts directly:
 
 ```sh
 source "${TAP_PLUGIN_DIR}/scripts/tap_helpers.sh"
@@ -78,6 +86,17 @@ tap_emit "$TMUX_PANE" "running"
 ```
 
 `tap_emit` is idempotent — calling it with the same state as the current state is a no-op.
+
+## Classifying terminal state
+
+For Stop hooks that need to determine `done` vs `asking` from assistant message text, use the shared heuristic:
+
+```sh
+state=$(printf '%s' "$message_text" | "$PLUGIN_DIR/scripts/tap-classify.sh")
+# → "done" or "asking"
+```
+
+This checks for trailing question marks and numbered lists. All bundled adapters use this to avoid duplicating the heuristic.
 
 ## Registering your adapter
 
@@ -107,7 +126,13 @@ tap_uninstall_my_tool() {
 }
 ```
 
-From your tool's hooks, source TAP and call `tap_emit`:
+From your tool's hooks, call the shared emit wrapper:
+
+```sh
+~/.tmux-tap/hooks/tap-emit.sh running
+```
+
+Or source TAP directly for more control:
 
 ```sh
 PLUGIN_DIR="${TAP_PLUGIN_DIR:-${HOME}/.tmux/plugins/tmux-tap}"

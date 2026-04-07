@@ -42,17 +42,9 @@ input=$(cat 2>/dev/null)
 pane_id="${TMUX_PANE:-}"
 [[ -z "$pane_id" ]] && exit 0
 
-# Heuristic: if last assistant message ends with '?' or ends with a numbered list
-# (last 5 lines), it's asking rather than waiting for a new prompt.
 last_msg=$(printf '%s' "$input" | jq -r '.last_assistant_message // ""' 2>/dev/null)
-
-state="done"
-if printf '%s' "$last_msg" | grep -qE '\?[[:space:]]*$'; then
-    state="asking"
-elif printf '%s' "$last_msg" | tail -5 | grep -qE '^[[:space:]]*[0-9]+\.[[:space:]]'; then
-    # Numbered list at end of message = presenting options to choose from
-    state="asking"
-fi
+state=$(printf '%s' "$last_msg" | "$PLUGIN_DIR/scripts/tap-classify.sh")
+state="${state:-done}"
 
 tap_emit "$pane_id" "$state"
 exit 0
@@ -120,7 +112,7 @@ tap_uninstall_claude_code() {
   local tmp
   tmp=$(mktemp)
   jq '
-    def is_tap: .tap_owned == true or ((.command? // "") | test("@tap_state|tap-stop\\.sh"));
+    def is_tap: .tap_owned == true or ((.command? // "") | test("tap-emit\\.sh|tap-stop\\.sh|@tap_state"));
     def rm_tap: map(select(is_tap | not));
     .hooks |= (
       if .UserPromptSubmit then .UserPromptSubmit |= rm_tap else . end |
@@ -137,9 +129,10 @@ tap_uninstall_claude_code() {
 
 _tap_claude_hooks_json() {
   local stop_hook="$1"
-  local run_cmd='[ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @tap_state running 2>/dev/null; true'
-  local ask_cmd='[ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @tap_state asking 2>/dev/null; true'
-  local plan_cmd='[ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @tap_state plan_ready 2>/dev/null; true'
+  local emit="${HOME}/.tmux-tap/hooks/tap-emit.sh"
+  local run_cmd="${emit} running"
+  local ask_cmd="${emit} asking"
+  local plan_cmd="${emit} plan_ready"
   jq -n \
     --arg stop  "$stop_hook" \
     --arg run   "$run_cmd" \
@@ -162,13 +155,14 @@ _tap_claude_hooks_json() {
 
 _tap_claude_hooks_snippet() {
   local stop_hook="$1"
+  local emit="${HOME}/.tmux-tap/hooks/tap-emit.sh"
   echo ""
   echo "  \"hooks\": {"
-  echo "    \"UserPromptSubmit\": [{\"matcher\": \"\", \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"[ -n \\\"\$TMUX_PANE\\\" ] && tmux set-option -p -t \$TMUX_PANE @tap_state running 2>/dev/null; true\"}]}],"
+  echo "    \"UserPromptSubmit\": [{\"matcher\": \"\", \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"${emit} running\"}]}],"
   echo "    \"PreToolUse\": ["
-  echo "      {\"matcher\": \"AskUserQuestion\", \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"[ -n \\\"\$TMUX_PANE\\\" ] && tmux set-option -p -t \$TMUX_PANE @tap_state asking 2>/dev/null; true\"}]},"
-  echo "      {\"matcher\": \"ExitPlanMode\",    \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"[ -n \\\"\$TMUX_PANE\\\" ] && tmux set-option -p -t \$TMUX_PANE @tap_state plan_ready 2>/dev/null; true\"}]},"
-  echo "      {\"matcher\": \"\",                \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"[ -n \\\"\$TMUX_PANE\\\" ] && tmux set-option -p -t \$TMUX_PANE @tap_state running 2>/dev/null; true\"}]}"
+  echo "      {\"matcher\": \"AskUserQuestion\", \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"${emit} asking\"}]},"
+  echo "      {\"matcher\": \"ExitPlanMode\",    \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"${emit} plan_ready\"}]},"
+  echo "      {\"matcher\": \"\",                \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"${emit} running\"}]}"
   echo "    ],"
   echo "    \"Stop\": [{\"matcher\": \"\", \"tap_owned\": true, \"hooks\": [{\"type\": \"command\", \"command\": \"${stop_hook}\"}]}]"
   echo "  }"

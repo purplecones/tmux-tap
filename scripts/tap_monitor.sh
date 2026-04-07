@@ -89,6 +89,37 @@ _reap_stale() {
   done < <(tmux list-panes -a -F $'#{pane_id}\t#{pane_current_command}\t#{@tap_state}' 2>/dev/null)
 }
 
+# Fire @tap_on_agent_idle when a pane has been in done/asking longer than @tap_idle_timeout.
+_check_idle() {
+  local timeout
+  timeout=$(get_tmux_option "@tap_idle_timeout" "0")
+  [[ "$timeout" -le 0 ]] 2>/dev/null && return 0
+
+  local now
+  now=$(date +%s)
+
+  while IFS=$'\t' read -r pane_id tap_state state_since idle_fired; do
+    [[ -z "$pane_id" ]] && continue
+
+    # Only idle-check attention states
+    [[ "$tap_state" != "done" && "$tap_state" != "asking" ]] && continue
+
+    # Already fired for this state
+    [[ "$idle_fired" == "1" ]] && continue
+
+    # No timestamp yet
+    [[ -z "$state_since" ]] && continue
+
+    # Check elapsed time
+    local elapsed=$(( now - state_since ))
+    if [[ "$elapsed" -ge "$timeout" ]]; then
+      tap_log "INFO" "idle: pane $pane_id in '$tap_state' for ${elapsed}s (timeout=${timeout}s)"
+      tmux set-option -p -t "$pane_id" @tap_idle_fired 1 2>/dev/null
+      _tap_fire "$pane_id" "agent_idle"
+    fi
+  done < <(tmux list-panes -a -F $'#{pane_id}\t#{@tap_state}\t#{@tap_state_since}\t#{@tap_idle_fired}' 2>/dev/null)
+}
+
 # Store PID for cleanup
 tmux setenv -g TAP_MONITOR_PID "$$" 2>/dev/null
 
@@ -103,6 +134,8 @@ while true; do
   if [[ "${#POLL_ADAPTERS[@]}" -gt 0 ]]; then
     _poll_once
   fi
+
+  _check_idle
 
   sleep "$POLL_INTERVAL"
 done

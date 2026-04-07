@@ -40,6 +40,10 @@ tap_emit() {
   # Pane-scoped option — readable as #{@tap_state} in format strings
   tmux set-option -p -t "$pane_id" @tap_state "$new_state" 2>/dev/null
 
+  # Track when this state was entered (epoch seconds) and reset idle flag
+  tmux set-option -p -t "$pane_id" @tap_state_since "$(date +%s)" 2>/dev/null
+  tmux set-option -pu -t "$pane_id" @tap_idle_fired 2>/dev/null
+
   # Refresh status bar
   tap_refresh
 
@@ -92,4 +96,7 @@ tap_cleanup_pane() {
     tap_emit "$pane_id" "inactive"
   fi
 
+  # Clear idle-related pane options
+  tmux set-option -pu -t "$pane_id" @tap_state_since 2>/dev/null
+  tmux set-option -pu -t "$pane_id" @tap_idle_fired 2>/dev/null
 }

@@ -24,19 +24,6 @@ tap_install_codex() {
     echo "[TAP] codex_hooks = true written to ${config_file}"
   fi
 
-  # Write the running hook script (UserPromptSubmit + PreToolUse)
-  local run_hook="${hooks_dir}/tap-run-codex.sh"
-  cat > "$run_hook" << 'RUN_HOOK'
-#!/usr/bin/env bash
-# TAP hook: fires on Codex UserPromptSubmit / PreToolUse events.
-pane_id="${TMUX_PANE:-}"
-[[ -z "$pane_id" ]] && exit 0
-tmux set-option -p -t "$pane_id" @tap_state running 2>/dev/null
-tmux refresh-client -S 2>/dev/null
-exit 0
-RUN_HOOK
-  chmod +x "$run_hook"
-
   # Write the Stop hook script
   cat > "$stop_hook" << 'STOP_HOOK'
 #!/usr/bin/env bash
@@ -50,16 +37,9 @@ input=$(cat 2>/dev/null)
 pane_id="${TMUX_PANE:-}"
 [[ -z "$pane_id" ]] && exit 0
 
-# Heuristic: if last assistant message ends with '?' or ends with a numbered list
-# (last 5 lines), it's asking rather than waiting for a new prompt.
 last_msg=$(printf '%s' "$input" | jq -r '.last_assistant_message // ""' 2>/dev/null)
-
-state="done"
-if printf '%s' "$last_msg" | grep -qE '\?[[:space:]]*$'; then
-    state="asking"
-elif printf '%s' "$last_msg" | tail -5 | grep -qE '^[[:space:]]*[0-9]+\.[[:space:]]'; then
-    state="asking"
-fi
+state=$(printf '%s' "$last_msg" | "$PLUGIN_DIR/scripts/tap-classify.sh")
+state="${state:-done}"
 
 tap_emit "$pane_id" "$state"
 exit 0
@@ -103,7 +83,7 @@ STOP_HOOK
   local tmp
   tmp=$(mktemp)
   local hooks_json
-  hooks_json=$(_tap_codex_hooks_json "$stop_hook" "$run_hook")
+  hooks_json=$(_tap_codex_hooks_json "$stop_hook")
 
   local base='{}'
   [[ -f "$hooks_file" ]] && base=$(cat "$hooks_file")
@@ -141,16 +121,17 @@ tap_uninstall_codex() {
       )
     ' "$hooks_file" > "$tmp" && mv "$tmp" "$hooks_file" || rm -f "$tmp"
   fi
-  rm -f "${HOME}/.tmux-tap/hooks/tap-stop-codex.sh"
+  rm -f "${HOME}/.tmux-tap/hooks/tap-stop-codex.sh" "${HOME}/.tmux-tap/hooks/tap-run-codex.sh"
   echo "[TAP] codex hooks removed from ${hooks_file}"
 }
 
 _tap_codex_hooks_json() {
   local stop_hook="$1"
-  local run_hook="$2"
+  local emit="${HOME}/.tmux-tap/hooks/tap-emit.sh"
+  local run_cmd="${emit} running"
   jq -n \
     --arg stop "$stop_hook" \
-    --arg run  "$run_hook" \
+    --arg run  "$run_cmd" \
     '{
       "UserPromptSubmit": [
         {"matcher": "", "tap_owned": true, "hooks": [{"type": "command", "command": $run}]}

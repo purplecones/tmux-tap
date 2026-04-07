@@ -16,14 +16,16 @@ This is pure bash. There are no build steps, test runners, or package managers. 
 ## Architecture
 
 ```
-tap.tmux                   ← TPM entry point; loads adapters, registers pane-exited hook, starts monitor
+tap.tmux                   ← TPM entry point; loads adapters, generates tap-emit.sh, starts monitor
 scripts/tap_helpers.sh     ← Shared utilities (get_tmux_option, tap_log, tap_refresh)
 scripts/tap_core.sh        ← State machine: tap_emit, tap_get_state, tap_cleanup_pane, _tap_fire
-scripts/tap_monitor.sh     ← Background polling loop for non-push adapters
+scripts/tap_monitor.sh     ← Background polling loop + stale-state reaper + idle checker
+scripts/tap-classify.sh    ← Shared heuristic: reads text from stdin, echoes "done" or "asking"
+scripts/tap-duration.sh    ← Outputs human-readable duration since last state change
 scripts/pane-exit.sh       ← Cleans up state when a pane exits
-adapters/claude_code.sh    ← Push-based adapter (0ms latency via settings.json hooks)
-adapters/codex.sh          ← Push-based adapter (0ms latency via hooks.json hooks)
-adapters/opencode.sh       ← Push-based adapter (0ms latency via JS plugin)
+adapters/claude_code.sh    ← Push-based adapter (via settings.json hooks → tap-emit.sh)
+adapters/codex.sh          ← Push-based adapter (via hooks.json hooks → tap-emit.sh)
+adapters/opencode.sh       ← Push-based adapter (via JS plugin → tap-emit.sh)
 adapters/_template.sh      ← Canonical template for new adapters
 install/codex_wrapper.sh   ← Legacy shell rc wrapper for Codex (superseded by push adapter)
 ```
@@ -55,18 +57,26 @@ Adapters load from (in priority order): absolute path, `~/.tmux-tap/adapters/<na
 
 `tap_install_claude_code` merges three hook types into `~/.claude/settings.json` using `jq`:
 - `UserPromptSubmit` → sets `@tap_state running` directly on the pane
-- `PreToolUse` → sets `running`, `asking` (on `AskUserQuestion`), or `plan_ready` (on `ExitPlanMode`)
-- `Stop` → runs `~/.tmux-tap/hooks/tap-stop.sh`, which uses `jq` to parse the stop JSON and calls `tap_emit` with `asking` or `done` based on whether the last assistant message ends with `?` or contains a numbered list
+- `PreToolUse` → calls `tap-emit.sh` with `running`, `asking` (on `AskUserQuestion`), or `plan_ready` (on `ExitPlanMode`)
+- `Stop` → runs `~/.tmux-tap/hooks/tap-stop.sh`, which extracts `last_assistant_message` via `jq` and pipes to `scripts/tap-classify.sh` to determine `done` or `asking`
 
 ### Valid states
 
 `inactive` | `running` | `thinking` | `plan_ready` | `done` | `asking`
 
+### Pane options set by `tap_emit`
+
+- `@tap_state` — current state string
+- `@tap_state_since` — epoch timestamp of last state change
+- `@tap_idle_fired` — internal flag to prevent re-firing idle event
+
 ### Event hooks (user-configured)
 
-`@tap_on_agent_start` | `@tap_on_agent_thinking` | `@tap_on_plan_ready` | `@tap_on_asking` | `@tap_on_agent_done` | `@tap_on_agent_stop`
+`@tap_on_agent_start` | `@tap_on_agent_thinking` | `@tap_on_plan_ready` | `@tap_on_asking` | `@tap_on_agent_done` | `@tap_on_agent_stop` | `@tap_on_agent_idle`
 
 Commands run via `tmux run-shell`, so tmux format strings (`#{pane_id}`) are expanded at fire time.
+
+`@tap_on_agent_idle` fires when a pane has been in `done` or `asking` for longer than `@tap_idle_timeout` seconds (default `0` = disabled). Fires once per idle period.
 
 ## Versioning and releases
 
