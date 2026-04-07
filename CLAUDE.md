@@ -68,6 +68,26 @@ Adapters load from (in priority order): absolute path, `~/.tmux-tap/adapters/<na
 
 Commands run via `tmux run-shell`, so tmux format strings (`#{pane_id}`) are expanded at fire time.
 
+## Versioning and releases
+
+This project uses [Semantic Versioning](https://semver.org/) with annotated git tags (`v0.1.0`, `v1.0.0`, etc.).
+
+- **MAJOR** — breaking changes to the adapter interface, state names, or event hook options
+- **MINOR** — new adapters, new states, new event hooks (backward-compatible)
+- **PATCH** — bug fixes, documentation updates, internal refactors
+
+### Release checklist
+
+1. Update `CHANGELOG.md`: move items from `[Unreleased]` to a new version section with today's date
+2. Commit: `git commit -m "release: vX.Y.Z"`
+3. Tag: `git tag -a vX.Y.Z -m "vX.Y.Z"` (annotated tag)
+4. Push: `git push && git push --tags`
+
+Users can pin a version in `.tmux.conf`:
+```tmux
+set -g @plugin 'purplecones/tmux-tap@v0.1.0'
+```
+
 ## Key constraints
 
 - Bash ≥ 3.2 compatible (no associative arrays with `-A`, no `bash 4+` features)
